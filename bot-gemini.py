@@ -6,7 +6,7 @@ import pandas as pd
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,11 +20,19 @@ load_dotenv()
 FROM_EMAIL = os.getenv("GMAIL_ADDRESS")
 APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
-# ✅ Gemini client
-client = genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+from session_manager import SessionManager
+from database import engine, get_db, SessionLocal
+import models
+from sqlalchemy.orm import Session
 
-# ✅ Local file configuration
-APPOINTMENTS_FOLDER = "appointments_data"  # Local folder for storing appointment files
+# Initialize Session Manager
+session_manager = SessionManager()
+
+# Create DB tables
+models.Base.metadata.create_all(bind=engine)
+
+# ✅ Local file configuration - DEPRECATED
+# APPOINTMENTS_FOLDER = "appointments_data"
 
 app = FastAPI()
 
@@ -116,6 +124,7 @@ def send_email(to_email, subject, body):
 # === Local File Functions ===
 def ensure_appointments_folder():
     """Create appointments folder if it doesn't exist"""
+    APPOINTMENTS_FOLDER = "appointments_data"
     if not os.path.exists(APPOINTMENTS_FOLDER):
         os.makedirs(APPOINTMENTS_FOLDER)
         print(f"✅ Created folder: {APPOINTMENTS_FOLDER}")
@@ -125,6 +134,7 @@ def save_to_excel(appointment_data):
     """Save appointment data to single Excel file, appending new rows"""
     try:
         ensure_appointments_folder()
+        APPOINTMENTS_FOLDER = "appointments_data"
         
         # Prepare data
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -165,6 +175,31 @@ def save_to_excel(appointment_data):
         return False
 
 
+# === Database Function ===
+def save_appointment_to_db(appointment_data):
+    """Save appointment data to SQLite database"""
+    try:
+        db = SessionLocal()
+        new_appointment = models.Appointment(
+            name=appointment_data.get("name", ""),
+            department=appointment_data.get("department", ""),
+            doctor=appointment_data.get("doctor", ""),
+            date=appointment_data.get("date", ""),
+            time=appointment_data.get("time", ""),
+            email=appointment_data.get("email", ""),
+            mobile=appointment_data.get("mobile", "")
+        )
+        db.add(new_appointment)
+        db.commit()
+        db.refresh(new_appointment)
+        db.close()
+        print(f"✅ Appointment saved to Database with ID: {new_appointment.id}")
+        return True
+    except Exception as e:
+        print(f"❌ Database save error: {e}")
+        return False
+
+
 # === Chat Function ===
 def get_completion_from_messages(messages, model="gemini-1.5-flash", temperature=0):
     # Convert OpenAI format to Gemini format
@@ -189,7 +224,7 @@ def get_completion_from_messages(messages, model="gemini-1.5-flash", temperature
 
 
 @app.post("/chat")
-async def chat(input: str = Form(...), newchat: str = Form(default="no"), session_id: str = Form(default="guest")):
+async def chat(background_tasks: BackgroundTasks, input: str = Form(...), newchat: str = Form(default="no"), session_id: str = Form(default="guest")):
     # Get or create session
     session = session_manager.get_session(session_id)
     
@@ -348,10 +383,7 @@ async def chat(input: str = Form(...), newchat: str = Form(default="no"), sessio
             # Send email
             email_success = False
             try:
-                send_email(
-                    to_email=appointment_data["email"],
-                    subject="Your Hospital Appointment Confirmation",
-                    body = f"""Dear {appointment_data.get('name','Patient')},
+                email_body = f"""Dear {appointment_data.get('name','Patient')},
                     Your appointment has been confirmed with the following details:
 
                     Doctor: {appointment_data.get('doctor','N/A').title()}
@@ -362,7 +394,11 @@ async def chat(input: str = Form(...), newchat: str = Form(default="no"), sessio
                     Department: {appointment_data.get('department','N/A')}
 
                     Thank you for choosing our hospital.
-                    """     
+                    """
+                background_tasks.add_task(send_email, 
+                    to_email=appointment_data["email"],
+                    subject="Your Hospital Appointment Confirmation",
+                    body=email_body
                 )
                 email_success = True
                 response += "\n\n📧 A confirmation email has been sent."
@@ -370,17 +406,28 @@ async def chat(input: str = Form(...), newchat: str = Form(default="no"), sessio
                 print("❌ Email error:", e)
                 response += "\n\n⚠️ Failed to send confirmation email."
             
-            # Save to Excel file
-            file_save_success = False
+            # Save to Database AND Excel
+            db_save_success = False
+            excel_save_success = False
+            
             try:
-                file_save_success = save_to_excel(appointment_data)
-                if file_save_success:
-                    response += "\n\n💾 Appointment data has been saved to Excel file."
+                # Save to DB (Scalable)
+                db_save_success = save_appointment_to_db(appointment_data)
+                
+                # Save to Excel (User Requirement)
+                excel_save_success = save_to_excel(appointment_data)
+                
+                if db_save_success and excel_save_success:
+                    response += "\n\n💾 Appointment saved to Database & Excel."
+                elif db_save_success:
+                     response += "\n\n💾 Saved to Database (Excel failed)."
+                elif excel_save_success:
+                     response += "\n\n💾 Saved to Excel (Database failed)."
                 else:
-                    response += "\n\n⚠️ Failed to save data to Excel file."
+                    response += "\n\n⚠️ Failed to save data."
             except Exception as e:
-                print("❌ File save error:", e)
-                response += "\n\n⚠️ Failed to save data to Excel file."
+                print("❌ Save error:", e)
+                response += "\n\n⚠️ Failed to save data."
                 
         else:
             response += "\n\n⚠️ No email address found. Please provide your email."
