@@ -7,7 +7,8 @@ from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from fastapi import FastAPI, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -36,6 +37,13 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+
+# ✅ Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+async def read_root():
+    return FileResponse('static/index.html')
 
 # Initial context
 initial_context = [
@@ -80,9 +88,13 @@ initial_context = [
     }
 ]
 
+from session_manager import SessionManager
+
+# Initialize Session Manager
+session_manager = SessionManager()
+
 # Store conversation + extracted details
-global_context = initial_context.copy()
-appointment_data = {}  # {name, dept, doctor, date, time, email, mobile}
+# global_context and appointment_data are now managed by session_manager
 
 
 # === Email Function ===
@@ -177,13 +189,23 @@ def get_completion_from_messages(messages, model="gemini-1.5-flash", temperature
 
 
 @app.post("/chat")
-async def chat(input: str = Form(...), newchat: str = Form(default="no")):
-    global global_context, appointment_data
+async def chat(input: str = Form(...), newchat: str = Form(default="no"), session_id: str = Form(default="guest")):
+    # Get or create session
+    session = session_manager.get_session(session_id)
+    
+    # Initialize context if empty
+    if not session["context"]:
+        session["context"] = initial_context.copy()
 
     # Reset chat if requested
     if newchat.lower() == "yes":
-        global_context = initial_context.copy()
-        appointment_data = {}
+        session_manager.clear_session(session_id)
+        session = session_manager.get_session(session_id) # Re-fetch clean session
+        session["context"] = initial_context.copy() # Re-init context
+        return JSONResponse({"response": "Chat cleared. How can I help you?", "context": session["context"], "data": {}})
+
+    global_context = session["context"]
+    appointment_data = session["data"]
 
     # Append user input
     global_context.append({"role": "user", "content": input})

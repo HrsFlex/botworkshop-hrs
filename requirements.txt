@@ -5,3 +5,4 @@ pandas
 openpyxl
 google-generativeai
 openai
+python-multipart
