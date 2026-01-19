@@ -1,8 +1,11 @@
+document.body.classList.add("show-chatbot");
+
 const chatbotToggler = document.querySelector(".chatbot-toggler");
 const closeBtn = document.querySelector(".close-btn");
 const chatbox = document.querySelector(".chatbox");
 const chatInput = document.querySelector(".chat-input textarea");
-const sendChatBtn = document.querySelector("#send-btn");
+const sendChatBtn = document.querySelector(".chat-input span#send-btn");
+const refreshBtn = document.querySelector("#refresh-btn"); // Ensure refresh button works
 
 let userMessage = null; // Variable to store user's message
 const API_URL = "/chat";

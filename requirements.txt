@@ -3,7 +3,8 @@ uvicorn
 python-dotenv
 pandas
 openpyxl
-google-generativeai
+groq
 openai
 python-multipart
 sqlalchemy
+tenacity

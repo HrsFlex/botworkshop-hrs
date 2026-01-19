@@ -10,7 +10,7 @@ from fastapi import FastAPI, Form, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
+
 from dotenv import load_dotenv
 
 # Load env vars
@@ -19,6 +19,14 @@ load_dotenv()
 # ✅ Gmail credentials (from .env)
 FROM_EMAIL = os.getenv("GMAIL_ADDRESS")
 APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+
+# ✅ Groq client
+from groq import Groq
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# ✅ Gemini client
+from google import genai
+genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 from session_manager import SessionManager
 from database import engine, get_db, SessionLocal
@@ -106,19 +114,26 @@ session_manager = SessionManager()
 
 
 # === Email Function ===
+# === Email Function ===
 def send_email(to_email, subject, body):
-    msg = MIMEMultipart()
-    msg["From"] = FROM_EMAIL
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+    print(f"📧 [Background] Attempting to send email to {to_email}...")
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(FROM_EMAIL, APP_PASSWORD)
-        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(FROM_EMAIL, APP_PASSWORD)
+            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
 
-    return True
+        print(f"✅ [Background] Email sent successfully to {to_email}")
+        return True
+    except Exception as e:
+        print(f"❌ [Background] Email Failed: {e}")
+        return False
 
 
 # === Local File Functions ===
@@ -201,26 +216,67 @@ def save_appointment_to_db(appointment_data):
 
 
 # === Chat Function ===
-def get_completion_from_messages(messages, model="gemini-1.5-flash", temperature=0):
-    # Convert OpenAI format to Gemini format
-    prompt = ""
-    for message in messages:
-        if message["role"] == "system":
-            prompt += f"System: {message['content']}\n\n"
-        elif message["role"] == "user":
-            prompt += f"User: {message['content']}\n\n"
-        elif message["role"] == "assistant":
-            prompt += f"Assistant: {message['content']}\n\n"
+# === Chat Function ===
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+
+@retry(
+    retry=retry_if_exception_type(Exception), 
+    stop=stop_after_attempt(3), 
+    wait=wait_exponential(multiplier=1, min=2, max=10)
+)
+def get_completion_from_messages(messages, model="llama-3.3-70b-versatile", temperature=0):
+    """
+    Dual-Provider Dispatcher:
+    - If model name contains 'gemini', use Google GenAI SDK.
+    - Otherwise, use Groq SDK (Llama 3).
+    """
     
-    # Generate response using Gemini
-    model_instance = genai.GenerativeModel(model)
-    response = model_instance.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(
-            temperature=temperature,
-        )
-    )
-    return response.text
+    # === GEMINI PROVIDER ===
+    if "gemini" in model.lower():
+        # Convert OpenAI format to Gemini prompt format
+        prompt = ""
+        for message in messages:
+            if message["role"] == "system":
+                prompt += f"System: {message['content']}\n\n"
+            elif message["role"] == "user":
+                prompt += f"User: {message['content']}\n\n"
+            elif message["role"] == "assistant":
+                prompt += f"Assistant: {message['content']}\n\n"
+        
+        try:
+            # Use specific Gemini Native Audio model if requested, else default fallback
+            target_model = model if "native-audio" in model else "gemini-2.5-flash"
+            
+            response = genai_client.models.generate_content(
+                model=target_model,
+                contents=prompt,
+                config=genai.types.GenerateContentConfig(
+                    temperature=temperature,
+                )
+            )
+            return response.text
+        except Exception as e:
+            print(f"❌ Gemini API Error: {e}")
+            if "429" in str(e) or "Resource exhausted" in str(e):
+                raise e # Trigger retry
+            return "I'm having trouble connecting to Gemini (Google) right now."
+
+    # === GROQ PROVIDER (Default) ===
+    else:
+        try:
+            # Ensure messages are in simple dict format (Groq/OpenAI standard)
+            response = groq_client.chat.completions.create(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"❌ Groq API Error: {e}")
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                raise e # Trigger retry
+            return "I'm having trouble connecting to Groq (Llama 3) right now."
 
 
 @app.post("/chat")
@@ -322,9 +378,12 @@ async def chat(background_tasks: BackgroundTasks, input: str = Form(...), newcha
 
     # Debug: Print extracted data
     print(f"🔍 Extracted appointment data: {appointment_data}")
+    print(f"👂 User input lowered: '{lowered}'")
+
     
     # ✅ If patient confirms appointment
-    if "confirm" in lowered:
+    confirms = ["confirm", "yes", "sure", "ok", "okay", "book it", "schedule"]
+    if any(word in lowered for word in confirms):
         # Try to extract data from the summary if appointment_data is incomplete
         if len(appointment_data) < 5:  # If we don't have most of the data
             summary_extraction_prompt = f"""
@@ -395,13 +454,25 @@ async def chat(background_tasks: BackgroundTasks, input: str = Form(...), newcha
 
                     Thank you for choosing our hospital.
                     """
-                background_tasks.add_task(send_email, 
-                    to_email=appointment_data["email"],
+                # background_tasks.add_task(send_email, 
+                #     to_email=appointment_data["email"],
+                #     subject="Your Hospital Appointment Confirmation",
+                #     body=email_body
+                # )
+                
+                # DEBUG: Sending synchronously to catch errors
+                print(f"🔄 [Sync Logic] Sending email now...")
+                is_sent = send_email(
+                    to_email=appointment_data["email"].strip(),
                     subject="Your Hospital Appointment Confirmation",
                     body=email_body
                 )
-                email_success = True
-                response += "\n\n📧 A confirmation email has been sent."
+                
+                if is_sent:
+                    email_success = True
+                    response += "\n\n📧 A confirmation email has been sent."
+                else:
+                    response += "\n\n⚠️ Failed to send confirmation email (Check console)."
             except Exception as e:
                 print("❌ Email error:", e)
                 response += "\n\n⚠️ Failed to send confirmation email."
